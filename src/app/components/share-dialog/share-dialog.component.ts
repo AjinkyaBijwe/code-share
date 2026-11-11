@@ -2,6 +2,7 @@ import {
   ChangeDetectionStrategy,
   Component,
   computed,
+  effect,
   inject,
   input,
   output,
@@ -33,23 +34,104 @@ import { InputDirective } from '../ui/input.directive';
       (close)="close.emit()"
     >
       <div class="space-y-4">
-        <!-- Tier 1: Stateless URL Compression -->
+        <!-- Tier 2: <=8-Char Short Snapshot Link -->
+        <div class="rounded-lg border border-border bg-background/60 p-3.5 space-y-2.5">
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <ui-icon name="cloud" iconClass="h-4 w-4 text-cyan-400" />
+              <span class="text-xs font-semibold text-foreground">
+                Short Link (#s=:id, max 8-char ID)
+              </span>
+            </div>
+            @if (snapshotId()) {
+              <ui-badge variant="success">{{ snapshotId()!.length }} chars ID</ui-badge>
+            } @else if (stats().exceedsHashRecommendation) {
+              <ui-badge variant="warning">Recommended (&gt;8k chars)</ui-badge>
+            } @else {
+              <ui-badge variant="outline">30-day KV TTL</ui-badge>
+            }
+          </div>
+
+          <p class="text-[11px] text-muted-foreground">
+            Generates a compact <code class="text-foreground">6-8 char</code> Base62 slug via
+            Cloudflare KV / Upstash Redis (<code class="text-foreground">edge/snapshot-worker.ts</code>). Saved per browser.
+          </p>
+
+          <div class="flex items-center gap-2">
+            <input
+              cpInput
+              type="text"
+              class="font-mono text-[11px]"
+              placeholder="https://your-worker.workers.dev or /api/snapshot"
+              [value]="vfs.snapshotEndpointSignal()"
+              (input)="vfs.setSnapshotEndpoint(asInputValue($event))"
+            />
+            <button
+              cpButton
+              variant="default"
+              size="sm"
+              type="button"
+              [disabled]="creatingSnapshot()"
+              (click)="createSnapshot()"
+            >
+              {{ creatingSnapshot() ? 'Creating...' : 'Create Short Link' }}
+            </button>
+          </div>
+
+          @if (snapshotUrl()) {
+            <div class="flex items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 p-2">
+              <input
+                cpInput
+                type="text"
+                readonly
+                class="h-7 font-mono text-[11px]"
+                [value]="snapshotUrl()!"
+                (focus)="selectAll($event)"
+              />
+              <button
+                cpButton
+                variant="secondary"
+                size="xs"
+                type="button"
+                (click)="copyText(snapshotUrl()!)"
+              >
+                Copy
+              </button>
+            </div>
+          }
+
+          @if (snapshotError()) {
+            <div class="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+              {{ snapshotError() }}
+            </div>
+          }
+        </div>
+
+        <!-- Tier 1: Compact Stateless URL Compression -->
         <div class="rounded-lg border border-border bg-background/60 p-3.5 space-y-2.5">
           <div class="flex items-center justify-between gap-2">
             <div class="flex items-center gap-2">
               <ui-icon name="link" iconClass="h-4 w-4 text-blue-400" />
               <span class="text-xs font-semibold text-foreground">
-                Tier 1 · Stateless URL Compression (LZ-String)
+                Stateless URL Compression (Zero-Backend)
               </span>
             </div>
             <ui-badge [variant]="stats().exceedsHashRecommendation ? 'warning' : 'success'">
-              {{ stats().compressedChars }} chars
+              @if (vfs.compressedHashSignal().startsWith('z0')) {
+                Template · {{ stats().compressedChars }} chars
+              } @else {
+                Token · {{ stats().compressedChars }} chars
+              }
             </ui-badge>
           </div>
 
           <p class="text-[11px] text-muted-foreground">
-            {{ stats().fileCount }} files ({{ stats().rawBytes }} B raw) compressed with
-            <code class="text-foreground">compressToEncodedURIComponent</code>.
+            @if (vfs.compressedHashSignal().startsWith('z0')) {
+              Unmodified starter template encoded as <code class="text-foreground">{{ vfs.compressedHashSignal() }}</code> (edits switch to deflated delta).
+            } @else {
+              {{ stats().fileCount }} files ({{ stats().rawBytes }} B raw) compacted with
+              template-delta + DEFLATE / LZ-String.
+            }
           </p>
 
           <div class="flex items-center gap-2">
@@ -90,7 +172,7 @@ import { InputDirective } from '../ui/input.directive';
             />
             <button
               cpButton
-              variant="default"
+              variant="outline"
               size="sm"
               type="button"
               (click)="copyDisplayedUrl()"
@@ -99,75 +181,6 @@ import { InputDirective } from '../ui/input.directive';
               {{ copiedUrl() ? 'Copied' : 'Copy' }}
             </button>
           </div>
-        </div>
-
-        <!-- Tier 2: Optional Ephemeral Cloud Snapshot -->
-        <div class="rounded-lg border border-border bg-background/60 p-3.5 space-y-2.5">
-          <div class="flex items-center justify-between gap-2">
-            <div class="flex items-center gap-2">
-              <ui-icon name="cloud" iconClass="h-4 w-4 text-cyan-400" />
-              <span class="text-xs font-semibold text-foreground">
-                Tier 2 · Ephemeral Cloud Snapshot (/s/:id, 30-day TTL)
-              </span>
-            </div>
-            @if (stats().exceedsHashRecommendation) {
-              <ui-badge variant="warning">Recommended (&gt;8k chars)</ui-badge>
-            } @else {
-              <ui-badge variant="outline">Optional</ui-badge>
-            }
-          </div>
-
-          <p class="text-[11px] text-muted-foreground">
-            POSTs compressed workspace state to an anonymous KV edge endpoint (Upstash Redis / Cloudflare KV).
-          </p>
-
-          <div class="flex items-center gap-2">
-            <input
-              cpInput
-              type="text"
-              class="font-mono text-[11px]"
-              placeholder="/api/snapshot"
-              [value]="vfs.snapshotEndpointSignal()"
-              (input)="vfs.setSnapshotEndpoint(asInputValue($event))"
-            />
-            <button
-              cpButton
-              variant="outline"
-              size="sm"
-              type="button"
-              [disabled]="creatingSnapshot()"
-              (click)="createSnapshot()"
-            >
-              {{ creatingSnapshot() ? 'Creating...' : 'Create Short Link' }}
-            </button>
-          </div>
-
-          @if (snapshotUrl()) {
-            <div class="flex items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 p-2">
-              <input
-                cpInput
-                type="text"
-                readonly
-                class="h-7 font-mono text-[11px]"
-                [value]="snapshotUrl()!"
-              />
-              <button
-                cpButton
-                variant="secondary"
-                size="xs"
-                type="button"
-                (click)="copyText(snapshotUrl()!)"
-              >
-                Copy
-              </button>
-            </div>
-          }
-
-          @if (snapshotError()) {
-            <div class="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
-              {{ snapshotError() }}
-            </div>
-          }
         </div>
       </div>
     </ui-dialog>
@@ -182,6 +195,7 @@ export class ShareDialogComponent {
   protected readonly urlFormat = signal<'hash' | 'query'>('hash');
   protected readonly copiedUrl = signal(false);
   protected readonly creatingSnapshot = signal(false);
+  protected readonly snapshotId = signal<string | null>(null);
   protected readonly snapshotUrl = signal<string | null>(null);
   protected readonly snapshotError = signal<string | null>(null);
 
@@ -191,6 +205,16 @@ export class ShareDialogComponent {
       ? this.vfs.shareUrlSignal()
       : this.vfs.queryShareUrlSignal(),
   );
+
+  constructor() {
+    effect(() => {
+      if (this.open()) {
+        this.snapshotId.set(null);
+        this.snapshotUrl.set(null);
+        this.snapshotError.set(null);
+      }
+    });
+  }
 
   protected async copyDisplayedUrl(): Promise<void> {
     this.vfs.syncShareToUrl();
@@ -204,16 +228,18 @@ export class ShareDialogComponent {
   protected async createSnapshot(): Promise<void> {
     this.creatingSnapshot.set(true);
     this.snapshotError.set(null);
+    this.snapshotId.set(null);
     this.snapshotUrl.set(null);
 
     try {
       const result = await this.vfs.createShortSnapshot();
+      this.snapshotId.set(result.id);
       this.snapshotUrl.set(result.url);
-      this.vfs.notify(`Created short snapshot ${result.id}`, 'success');
+      this.vfs.notify(`Created short snapshot #s=${result.id}`, 'success');
     } catch (err) {
       const detail = err instanceof Error ? err.message : 'Request failed';
       this.snapshotError.set(
-        `No snapshot KV endpoint active at "${this.vfs.snapshotEndpointSignal()}" (${detail}). Use Tier 1 URL compression above or point this field to a Cloudflare KV / Upstash Redis /api/snapshot function.`,
+        `No snapshot KV worker reachable at "${this.vfs.snapshotEndpointSignal()}" (${detail}). Deploy edge/snapshot-worker.ts via "npx wrangler deploy" and paste its URL above, or use Stateless URL below.`,
       );
     } finally {
       this.creatingSnapshot.set(false);

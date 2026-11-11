@@ -158,22 +158,7 @@ export class MonacoBridgeService {
       },
     });
 
-    const compilerOptions: Monaco.typescript.CompilerOptions = {
-      target: monaco.typescript.ScriptTarget.Latest,
-      module: monaco.typescript.ModuleKind.ESNext,
-      moduleResolution: monaco.typescript.ModuleResolutionKind.NodeJs,
-      jsx: monaco.typescript.JsxEmit.ReactJSX,
-      experimentalDecorators: true,
-      emitDecoratorMetadata: true,
-      strict: true,
-      allowNonTsExtensions: true,
-      esModuleInterop: true,
-      allowSyntheticDefaultImports: true,
-      resolveJsonModule: true,
-      isolatedModules: true,
-      noEmit: false,
-      allowJs: true,
-    };
+    const compilerOptions = this.createCompilerOptions(monaco, monaco.typescript.ScriptTarget.Latest);
 
     monaco.typescript.typescriptDefaults.setCompilerOptions(compilerOptions);
     monaco.typescript.javascriptDefaults.setCompilerOptions(compilerOptions);
@@ -276,6 +261,29 @@ export class MonacoBridgeService {
     return monaco.editor.getModel(monaco.Uri.file(path));
   }
 
+  private createCompilerOptions(
+    monaco: typeof Monaco,
+    target: Monaco.typescript.ScriptTarget,
+  ): Monaco.typescript.CompilerOptions {
+    return {
+      target,
+      module: monaco.typescript.ModuleKind.ESNext,
+      moduleResolution: monaco.typescript.ModuleResolutionKind.NodeJs,
+      jsx: monaco.typescript.JsxEmit.ReactJSX,
+      experimentalDecorators: true,
+      emitDecoratorMetadata: true,
+      useDefineForClassFields: false,
+      strict: true,
+      allowNonTsExtensions: true,
+      esModuleInterop: true,
+      allowSyntheticDefaultImports: true,
+      resolveJsonModule: true,
+      isolatedModules: true,
+      noEmit: false,
+      allowJs: true,
+    };
+  }
+
   /**
    * Transpiles a TypeScript / TSX / JSX file using Monaco's background TypeScript worker.
    * Ensures all workspace files are synced so cross-file module imports resolve cleanly.
@@ -283,22 +291,37 @@ export class MonacoBridgeService {
   async emitJavaScript(
     files: Record<string, VirtualFile>,
     targetPath: string,
+    target: 'latest' | 'es2019' = 'latest',
   ): Promise<string> {
     const monaco = await this.ensureInitialized();
     this.syncModels(monaco, files);
 
-    const uri = monaco.Uri.file(targetPath);
-    const workerFactory = await monaco.typescript.getTypeScriptWorker();
-    const client = await workerFactory(uri);
-    const emitOutput = await client.getEmitOutput(uri.toString());
-
-    const jsOutput = emitOutput.outputFiles.find(
-      (f) => f.name.endsWith('.js') || f.name.endsWith('.jsx') || f.name.endsWith('.mjs'),
-    );
-    if (!jsOutput) {
-      throw new Error(`TypeScript worker emitted no JavaScript for ${targetPath}`);
+    if (target === 'es2019') {
+      monaco.typescript.typescriptDefaults.setCompilerOptions(
+        this.createCompilerOptions(monaco, monaco.typescript.ScriptTarget.ES2019),
+      );
     }
-    return jsOutput.text;
+
+    try {
+      const uri = monaco.Uri.file(targetPath);
+      const workerFactory = await monaco.typescript.getTypeScriptWorker();
+      const client = await workerFactory(uri);
+      const emitOutput = await client.getEmitOutput(uri.toString());
+
+      const jsOutput = emitOutput.outputFiles.find(
+        (f) => f.name.endsWith('.js') || f.name.endsWith('.jsx') || f.name.endsWith('.mjs'),
+      );
+      if (!jsOutput) {
+        throw new Error(`TypeScript worker emitted no JavaScript for ${targetPath}`);
+      }
+      return jsOutput.text;
+    } finally {
+      if (target === 'es2019') {
+        monaco.typescript.typescriptDefaults.setCompilerOptions(
+          this.createCompilerOptions(monaco, monaco.typescript.ScriptTarget.Latest),
+        );
+      }
+    }
   }
 
   /**

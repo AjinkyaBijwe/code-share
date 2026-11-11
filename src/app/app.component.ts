@@ -78,6 +78,15 @@ export class App implements OnDestroy {
     this.activeDragCleanup?.();
   }
 
+  @HostListener('window:hashchange')
+  protected onHashChange(): void {
+    void this.vfs.hydrateFromCurrentHash().then((hydrated) => {
+      if (hydrated) {
+        void this.runtime.runActiveWorkspace();
+      }
+    });
+  }
+
   @HostListener('window:keydown', ['$event'])
   protected onGlobalKeyDown(event: KeyboardEvent): void {
     const isModifier = event.metaKey || event.ctrlKey;

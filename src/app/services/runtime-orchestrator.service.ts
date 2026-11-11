@@ -1,5 +1,10 @@
 import { Injectable, computed, inject, signal } from '@angular/core';
-import type { SandpackClient, SandpackMessage } from '@codesandbox/sandpack-client';
+import type {
+  SandpackClient,
+  SandpackMessage,
+  SandpackTemplate,
+  SandboxSetup,
+} from '@codesandbox/sandpack-client';
 import {
   ConsoleEntry,
   ConsoleFilter,
@@ -206,6 +211,7 @@ export class RuntimeOrchestratorService {
   private previewIframe: HTMLIFrameElement | null = null;
   private sandpackIframe: HTMLIFrameElement | null = null;
   private sandpackClient: SandpackClient | null = null;
+  private sandpackEnv: RuntimeEnvironment | null = null;
   private sandpackUnsubscribe: (() => void) | null = null;
   private pyodideWorker: Worker | null = null;
   private autoRunTimer: ReturnType<typeof setTimeout> | null = null;
@@ -488,46 +494,24 @@ export default ${JSON.stringify(file.content)};
     this.clearLogs();
 
     try {
-      const sandpackFiles: Record<string, { code: string; active?: boolean }> = {};
-      for (const file of Object.values(files)) {
-        sandpackFiles[file.path] = {
-          code: file.content,
-          active: file.path === this.vfs.activeFileSignal(),
-        };
+      if (this.sandpackClient && this.sandpackEnv !== env) {
+        this.disposeSandpack();
       }
 
-      const template =
-        env === 'angular'
-          ? 'angular-cli'
-          : env === 'react'
-            ? 'create-react-app-typescript'
-            : 'parcel';
-
-      const entryFile = this.resolveEntryFile(env, files);
+      const setup = await this.buildSandpackSetup(env, files);
+      this.sandpackEnv = env;
 
       if (this.sandpackClient) {
-        this.sandpackClient.updateSandbox({
-          files: sandpackFiles,
-          entry: entryFile?.path,
-          template,
-        });
+        this.sandpackClient.updateSandbox(setup);
         return;
       }
 
       const { loadSandpackClient } = await import('@codesandbox/sandpack-client');
-      const client = await loadSandpackClient(
-        iframe,
-        {
-          files: sandpackFiles,
-          entry: entryFile?.path,
-          template,
-        },
-        {
-          showErrorScreen: true,
-          showLoadingScreen: true,
-          clearConsoleOnFirstCompile: true,
-        },
-      );
+      const client = await loadSandpackClient(iframe, setup, {
+        showErrorScreen: true,
+        showLoadingScreen: true,
+        clearConsoleOnFirstCompile: true,
+      });
 
       this.sandpackClient = client;
       this.sandpackUnsubscribe = client.listen((msg: SandpackMessage) => {
@@ -539,6 +523,96 @@ export default ${JSON.stringify(file.content)};
       this.summaryState.set({ status: 'error', detail: message });
       this.appendLog('error', `Sandpack error: ${message}`, 'sandpack');
     }
+  }
+
+  /**
+   * Builds a Sandpack `SandboxSetup`, pre-transpiling TS/TSX with TypeScript 5
+   * (so modern syntax like `?.` and `??` works despite Sandpack's legacy parser)
+   * and supplying fallback `dependencies` and HTML script entries.
+   */
+  private async buildSandpackSetup(
+    env: RuntimeEnvironment,
+    files: Record<string, VirtualFile>,
+  ): Promise<SandboxSetup> {
+    const activeFile = this.vfs.activeFileSignal();
+    const sandpackFiles: Record<string, { code: string; active?: boolean }> = {};
+
+    const toCompiledPath = (path: string): string =>
+      path.endsWith('.tsx') || path.endsWith('.ts')
+        ? path.replace(/\.tsx?$/, '.js')
+        : path;
+
+    for (const file of Object.values(files)) {
+      if (file.path.endsWith('.ts') || file.path.endsWith('.tsx')) {
+        const emitted = await this.monacoBridge.emitJavaScript(files, file.path, 'es2019');
+        const rewritten = emitted.replace(
+          /(from\s+['"][^'"]+)\.tsx?(['"])/g,
+          '$1.js$2',
+        );
+        sandpackFiles[toCompiledPath(file.path)] = {
+          code: rewritten,
+          active: file.path === activeFile,
+        };
+      } else {
+        sandpackFiles[file.path] = {
+          code: file.content,
+          active: file.path === activeFile,
+        };
+      }
+    }
+
+    const template: SandpackTemplate =
+      env === 'react' ? 'create-react-app-typescript' : 'parcel';
+
+    const entryFile = this.resolveEntryFile(env, files);
+    const entry = entryFile ? toCompiledPath(entryFile.path) : undefined;
+    let dependencies: Record<string, string> = {};
+    let devDependencies: Record<string, string> | undefined;
+
+    const pkgFile = sandpackFiles['/package.json'];
+    if (pkgFile) {
+      try {
+        const pkg = JSON.parse(pkgFile.code) as Record<string, unknown>;
+        if (pkg['dependencies'] && typeof pkg['dependencies'] === 'object') {
+          dependencies = { ...(pkg['dependencies'] as Record<string, string>) };
+        }
+        if (pkg['devDependencies'] && typeof pkg['devDependencies'] === 'object') {
+          devDependencies = { ...(pkg['devDependencies'] as Record<string, string>) };
+        }
+        if (env === 'react' && !dependencies['@babel/runtime']) {
+          dependencies['@babel/runtime'] = '^7.26.0';
+          pkg['dependencies'] = dependencies;
+        }
+        if (entry && !pkg['main']) {
+          pkg['main'] = entry;
+        }
+        sandpackFiles['/package.json'] = {
+          ...pkgFile,
+          code: JSON.stringify(pkg, null, 2),
+        };
+      } catch {
+        // Leave invalid user JSON untouched so Sandpack reports syntax errors.
+      }
+    }
+
+    const htmlFile = sandpackFiles['/index.html'];
+    if (htmlFile && template === 'parcel' && entry && !htmlFile.code.includes('<script')) {
+      const injected = htmlFile.code.includes('</body>')
+        ? htmlFile.code.replace('</body>', `  <script src=".${entry}"></script>\n  </body>`)
+        : `${htmlFile.code}\n<script src=".${entry}"></script>`;
+      sandpackFiles['/index.html'] = { ...htmlFile, code: injected };
+    }
+    if (env === 'react' && htmlFile && !sandpackFiles['/public/index.html']) {
+      sandpackFiles['/public/index.html'] = { code: htmlFile.code };
+    }
+
+    return {
+      files: sandpackFiles,
+      dependencies,
+      ...(devDependencies ? { devDependencies } : {}),
+      ...(entry ? { entry } : {}),
+      template,
+    };
   }
 
   private handleSandpackMessage(msg: SandpackMessage): void {
@@ -590,6 +664,7 @@ export default ${JSON.stringify(file.content)};
   }
 
   private disposeSandpack(): void {
+    this.sandpackEnv = null;
     if (this.sandpackUnsubscribe) {
       this.sandpackUnsubscribe();
       this.sandpackUnsubscribe = null;

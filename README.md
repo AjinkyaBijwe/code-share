@@ -4,7 +4,7 @@ Browser-based multi-file code editor and execution sandbox built with **Angular 
 
 ## Features
 
-- **Zero-Login Sharing**: Compresses multi-file workspaces with `lz-string` (`#code=...` or `?pad=...`) and auto-saves locally to IndexedDB (`idb-keyval`). Supports optional `/api/snapshot` short links and `.zip` export (`fflate`).
+- **Zero-Login Sharing**: Compresses multi-file workspaces with template-delta diffing + `fflate` DEFLATE / `lz-string` (`#code=...` or `?pad=...`, down to **3 chars** for starter templates) and supports `<= 8`-char short snapshot slugs (`#s=Ab3k9Z` / `?s=Ab3k9Z` / `/s/Ab3k9Z`) backed by `edge/snapshot-worker.ts`, auto-saves to IndexedDB (`idb-keyval`), and exports `.zip` archives (`fflate`).
 - **Pre-Configured Templates**: TypeScript, Angular Standalone + Signals, React + TS, and Python 3 (Pyodide WASM Web Worker with `micropip` support from `requirements.txt`).
 - **Multi-File Monaco Editor**: Per-file `ITextModel` tabs, cross-file TypeScript IntelliSense, Prettier formatting (`Shift + Alt + F`), and keyboard shortcuts (`Cmd/Ctrl + S` to sync & copy link, `Cmd/Ctrl + Enter` to run).
 - **Live Preview & Unified Console**: Resizable 3-pane layout, responsive viewport toggles (`Desktop` / `Tablet` / `Mobile`), Fullscreen preview mode (`Esc` to exit), and log-level console filtering.
@@ -38,3 +38,18 @@ To verify a GitHub Pages subpath build locally:
 ```bash
 npm run build:gh-pages
 ```
+
+## Short Snapshot Links (<= 8-Char Slugs)
+
+[`edge/snapshot-worker.ts`](edge/snapshot-worker.ts) provides a lightweight zero-auth snapshot API (supporting **Cloudflare Workers KV** or **Upstash Redis REST**) that generates 6–8 character Base62 IDs (`#s=Ab3k9Z`) with a sliding 30-day TTL and CORS enabled for GitHub Pages.
+
+1. Configure either a `CODEPAD_KV` namespace in [`wrangler.toml`](wrangler.toml) or set Upstash secrets:
+   ```bash
+   npx wrangler secret put UPSTASH_REDIS_REST_URL
+   npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
+   ```
+2. Deploy the worker:
+   ```bash
+   npx wrangler deploy
+   ```
+3. Paste the deployed `https://<worker>.workers.dev` URL into the Share dialog's Short Link endpoint field (saved in `localStorage`) or set `<meta name="codepad-snapshot-endpoint" content="https://<worker>.workers.dev" />` in [`src/index.html`](src/index.html).

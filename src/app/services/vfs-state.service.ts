@@ -1,5 +1,5 @@
 import { Injectable, computed, signal } from '@angular/core';
-import { zipSync, strToU8 } from 'fflate';
+import { deflateSync, inflateSync, strFromU8, strToU8, zipSync } from 'fflate';
 import { get as idbGet, set as idbSet } from 'idb-keyval';
 import { compressToEncodedURIComponent, decompressFromEncodedURIComponent } from 'lz-string';
 import { createTemplateWorkspace } from '../config/templates.config';
@@ -18,13 +18,51 @@ import {
 } from '../utils/path.utils';
 
 const IDB_WORKSPACE_KEY = 'codepad:workspace:v1';
+const SNAPSHOT_ENDPOINT_STORAGE_KEY = 'codepad:snapshot-endpoint:v1';
 const LARGE_HASH_CHAR_LIMIT = 8000;
+export const SNAPSHOT_ID_PATTERN = /^[A-Za-z0-9_-]{1,8}$/;
+const ENV_TO_CODE: Record<RuntimeEnvironment, string> = {
+  typescript: 't',
+  angular: 'a',
+  react: 'r',
+  python: 'p',
+};
+const CODE_TO_ENV: Record<string, RuntimeEnvironment> = {
+  t: 'typescript',
+  a: 'angular',
+  r: 'react',
+  p: 'python',
+};
 const VALID_ENVIRONMENTS: ReadonlySet<RuntimeEnvironment> = new Set([
   'typescript',
   'angular',
   'react',
   'python',
 ]);
+
+function readInitialSnapshotEndpoint(): string {
+  if (typeof window !== 'undefined') {
+    try {
+      const saved = window.localStorage.getItem(SNAPSHOT_ENDPOINT_STORAGE_KEY)?.trim();
+      if (saved) return saved;
+    } catch {
+      // Ignore storage access errors in restricted contexts
+    }
+    const meta = document
+      .querySelector('meta[name="codepad-snapshot-endpoint"]')
+      ?.getAttribute('content')
+      ?.trim();
+    if (meta) return meta;
+  }
+  return '/api/snapshot';
+}
+
+export function buildShortShareUrl(id: string): string {
+  if (typeof window === 'undefined') {
+    return `#s=${id}`;
+  }
+  return `${window.location.origin}${window.location.pathname}#s=${id}`;
+}
 
 export interface ToastNotice {
   id: number;
@@ -51,19 +89,22 @@ export class HttpSnapshotAdapter implements SnapshotStorageAdapter {
     }
 
     const data = (await res.json()) as Partial<SnapshotCreateResult>;
-    if (!data.id) {
-      throw new Error('Snapshot response missing id');
+    const id = typeof data.id === 'string' ? data.id.trim() : '';
+    if (!SNAPSHOT_ID_PATTERN.test(id)) {
+      throw new Error('Snapshot response missing valid <=8-char id');
     }
 
-    const origin = typeof window !== 'undefined' ? window.location.origin : '';
     return {
-      id: data.id,
-      url: data.url ?? `${origin}/s/${data.id}`,
+      id,
+      url: data.url ?? buildShortShareUrl(id),
       expiresAt: data.expiresAt,
     };
   }
 
   async resolveSnapshot(id: string): Promise<string | null> {
+    if (!SNAPSHOT_ID_PATTERN.test(id)) {
+      return null;
+    }
     const endpoint = this.endpointBase().replace(/\/$/, '');
     const res = await fetch(`${endpoint}/${encodeURIComponent(id)}`);
     if (!res.ok) {
@@ -130,16 +171,242 @@ export function validateWorkspacePayload(raw: unknown): WorkspacePayload | null 
   };
 }
 
+interface CompactDeltaPayload {
+  v: 2;
+  e: string;
+  a?: string;
+  u?: Record<string, string>;
+  r?: string[];
+  n?: string[];
+  d?: string[];
+  l?: Record<string, string>;
+}
+
+interface CompactFullPayload {
+  v: 2;
+  e: string;
+  a: string;
+  f: Record<string, string>;
+  n?: string[];
+  d?: string[];
+  l?: Record<string, string>;
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function base64UrlToBytes(input: string): Uint8Array {
+  const padded =
+    input.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((input.length + 3) % 4);
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function sortedStringListsEqual(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((val, idx) => val === sb[idx]);
+}
+
+function collectLanguageOverrides(files: Record<string, VirtualFile>): Record<string, string> {
+  const overrides: Record<string, string> = {};
+  for (const [path, file] of Object.entries(files)) {
+    if (file.language && file.language !== detectLanguageFromPath(path)) {
+      overrides[path] = file.language;
+    }
+  }
+  return overrides;
+}
+
+function encodeDeltaToken(normalized: WorkspacePayload): string {
+  const base = createTemplateWorkspace(normalized.env);
+  const envCode = ENV_TO_CODE[normalized.env];
+
+  const upserted: Record<string, string> = {};
+  for (const [path, file] of Object.entries(normalized.files)) {
+    if (!base.files[path] || base.files[path].content !== file.content) {
+      upserted[path] = file.content;
+    }
+  }
+
+  const removed = Object.keys(base.files).filter((path) => !normalized.files[path]);
+  const entryPaths = Object.values(normalized.files)
+    .filter((f) => f.isEntry)
+    .map((f) => f.path);
+  const baseEntries = Object.values(base.files)
+    .filter((f) => f.isEntry)
+    .map((f) => f.path);
+  const entriesChanged = !sortedStringListsEqual(entryPaths, baseEntries);
+  const folders = normalized.folders ?? [];
+  const foldersChanged = !sortedStringListsEqual(folders, base.folders ?? []);
+  const overrides = collectLanguageOverrides(normalized.files);
+  const activeChanged = normalized.activeFile !== base.activeFile;
+
+  if (
+    Object.keys(upserted).length === 0 &&
+    removed.length === 0 &&
+    !entriesChanged &&
+    !foldersChanged &&
+    Object.keys(overrides).length === 0 &&
+    !activeChanged
+  ) {
+    return `z0${envCode}`;
+  }
+
+  const delta: CompactDeltaPayload = {
+    v: 2,
+    e: envCode,
+    ...(activeChanged ? { a: normalized.activeFile } : {}),
+    ...(Object.keys(upserted).length > 0 ? { u: upserted } : {}),
+    ...(removed.length > 0 ? { r: removed } : {}),
+    ...(entriesChanged ? { n: entryPaths } : {}),
+    ...(foldersChanged ? { d: folders } : {}),
+    ...(Object.keys(overrides).length > 0 ? { l: overrides } : {}),
+  };
+
+  return `z1.${bytesToBase64Url(deflateSync(strToU8(JSON.stringify(delta)), { level: 9 }))}`;
+}
+
+function encodeFullDeflateToken(normalized: WorkspacePayload): string {
+  const filesMap: Record<string, string> = {};
+  for (const [path, file] of Object.entries(normalized.files)) {
+    filesMap[path] = file.content;
+  }
+  const entryPaths = Object.values(normalized.files)
+    .filter((f) => f.isEntry)
+    .map((f) => f.path);
+  const folders = normalized.folders ?? [];
+  const overrides = collectLanguageOverrides(normalized.files);
+
+  const full: CompactFullPayload = {
+    v: 2,
+    e: ENV_TO_CODE[normalized.env],
+    a: normalized.activeFile,
+    f: filesMap,
+    ...(entryPaths.length > 0 ? { n: entryPaths } : {}),
+    ...(folders.length > 0 ? { d: folders } : {}),
+    ...(Object.keys(overrides).length > 0 ? { l: overrides } : {}),
+  };
+
+  return `z2.${bytesToBase64Url(deflateSync(strToU8(JSON.stringify(full)), { level: 9 }))}`;
+}
+
 export function serializeWorkspaceToken(payload: WorkspacePayload): string {
-  return compressToEncodedURIComponent(JSON.stringify(payload));
+  const normalized = validateWorkspacePayload(payload) ?? payload;
+  const deltaToken = encodeDeltaToken(normalized);
+  if (deltaToken.startsWith('z0')) {
+    return deltaToken;
+  }
+  const fullToken = encodeFullDeflateToken(normalized);
+  const lzToken = compressToEncodedURIComponent(JSON.stringify(normalized));
+
+  let shortest = deltaToken;
+  if (fullToken.length < shortest.length) shortest = fullToken;
+  if (lzToken.length < shortest.length) shortest = lzToken;
+  return shortest;
 }
 
 export function deserializeWorkspaceToken(token: string): WorkspacePayload | null {
-  if (!token || !token.trim()) {
+  const trimmed = token?.trim();
+  if (!trimmed) {
     return null;
   }
+
   try {
-    const json = decompressFromEncodedURIComponent(token.trim());
+    if (/^z0[tarp]$/.test(trimmed)) {
+      const env = CODE_TO_ENV[trimmed.slice(2)];
+      return env ? createTemplateWorkspace(env) : null;
+    }
+
+    if (trimmed.startsWith('z1.')) {
+      const json = strFromU8(inflateSync(base64UrlToBytes(trimmed.slice(3))));
+      const delta = JSON.parse(json) as Partial<CompactDeltaPayload>;
+      const env = delta.e ? CODE_TO_ENV[delta.e] : undefined;
+      if (!env) return null;
+
+      const base = createTemplateWorkspace(env);
+      const files: Record<string, VirtualFile> = { ...base.files };
+
+      if (Array.isArray(delta.r)) {
+        for (const path of delta.r) {
+          delete files[normalizeVirtualPath(path)];
+        }
+      }
+
+      if (delta.u && typeof delta.u === 'object') {
+        for (const [rawPath, content] of Object.entries(delta.u)) {
+          if (typeof content !== 'string') continue;
+          const path = normalizeVirtualPath(rawPath);
+          const prev = files[path];
+          files[path] = {
+            path,
+            content,
+            language: delta.l?.[path] ?? prev?.language ?? detectLanguageFromPath(path),
+            ...(prev?.isEntry ? { isEntry: true } : {}),
+          };
+        }
+      }
+
+      if (Array.isArray(delta.n)) {
+        const entrySet = new Set(delta.n.map((p) => normalizeVirtualPath(p)));
+        for (const [path, file] of Object.entries(files)) {
+          files[path] = entrySet.has(path)
+            ? { ...file, isEntry: true }
+            : { path: file.path, content: file.content, language: file.language };
+        }
+      }
+
+      return validateWorkspacePayload({
+        v: 1,
+        env,
+        activeFile: delta.a ?? base.activeFile,
+        files,
+        folders: delta.d ?? base.folders ?? [],
+      });
+    }
+
+    if (trimmed.startsWith('z2.')) {
+      const json = strFromU8(inflateSync(base64UrlToBytes(trimmed.slice(3))));
+      const full = JSON.parse(json) as Partial<CompactFullPayload>;
+      const env = full.e ? CODE_TO_ENV[full.e] : undefined;
+      if (!env || !full.f || typeof full.f !== 'object') return null;
+
+      const entrySet = new Set(
+        Array.isArray(full.n) ? full.n.map((p) => normalizeVirtualPath(p)) : [],
+      );
+      const files: Record<string, VirtualFile> = {};
+      for (const [rawPath, content] of Object.entries(full.f)) {
+        if (typeof content !== 'string') continue;
+        const path = normalizeVirtualPath(rawPath);
+        files[path] = {
+          path,
+          content,
+          language: full.l?.[path] ?? detectLanguageFromPath(path),
+          ...(entrySet.has(path) ? { isEntry: true } : {}),
+        };
+      }
+
+      return validateWorkspacePayload({
+        v: 1,
+        env,
+        activeFile: full.a ?? Object.keys(files)[0],
+        files,
+        folders: full.d ?? [],
+      });
+    }
+
+    const json = decompressFromEncodedURIComponent(trimmed);
     if (!json) {
       return null;
     }
@@ -159,7 +426,7 @@ export class VfsStateService {
   private readonly dirtyState = signal<boolean>(false);
   private readonly hydrationSourceState = signal<HydrationSource>('template');
   private readonly toastState = signal<ToastNotice | null>(null);
-  private readonly snapshotEndpointState = signal<string>('/api/snapshot');
+  private readonly snapshotEndpointState = signal<string>(readInitialSnapshotEndpoint());
 
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -201,10 +468,11 @@ export class VfsStateService {
 
   readonly queryShareUrlSignal = computed<string>(() => {
     const token = this.compressedHashSignal();
+    const encoded = encodeURIComponent(token);
     if (typeof window === 'undefined') {
-      return `?pad=${token}`;
+      return `?pad=${encoded}`;
     }
-    return `${window.location.origin}${window.location.pathname}?pad=${token}`;
+    return `${window.location.origin}${window.location.pathname}?pad=${encoded}`;
   });
 
   readonly isLargeWorkspaceSignal = computed<boolean>(
@@ -224,26 +492,26 @@ export class VfsStateService {
 
   /**
    * Hydrates initial workspace in priority order:
-   * 1) URL hash `#code=...`
-   * 2) URL query `?pad=...`
-   * 3) Short link `/s/:id` via SnapshotStorageAdapter
-   * 4) IndexedDB persisted workspace
-   * 5) Default TypeScript starter template
+   * 1) Hash short snapshot `#s=<id>` (max 8 chars)
+   * 2) Stateless URL hash `#code=<token>`
+   * 3) Query short snapshot `?s=<id>` or stateless query `?pad=<token>`
+   * 4) Short path `/s/:id` (max 8 chars) via SnapshotStorageAdapter
+   * 5) IndexedDB persisted workspace
+   * 6) Default TypeScript starter template
    */
   async bootstrapHydration(): Promise<void> {
     if (typeof window !== 'undefined') {
-      const hash = window.location.hash;
-      if (hash.startsWith('#code=')) {
-        const token = hash.slice('#code='.length);
-        const decoded = deserializeWorkspaceToken(token);
-        if (decoded) {
-          this.applyWorkspace(decoded, 'url-hash', false);
-          return;
-        }
-        this.notify('Shared URL hash was invalid; loaded fallback workspace.', 'warn');
+      if (await this.hydrateFromCurrentHash()) {
+        return;
       }
 
       const params = new URLSearchParams(window.location.search);
+      const queryShort = params.get('s')?.trim();
+      if (queryShort && SNAPSHOT_ID_PATTERN.test(queryShort)) {
+        const loaded = await this.hydrateFromSnapshotId(queryShort);
+        if (loaded) return;
+      }
+
       const padToken = params.get('pad');
       if (padToken) {
         const decoded = deserializeWorkspaceToken(padToken);
@@ -254,20 +522,10 @@ export class VfsStateService {
         this.notify('Shared ?pad parameter was invalid; loaded fallback workspace.', 'warn');
       }
 
-      const shortMatch = window.location.pathname.match(/(?:^|\/)s\/([A-Za-z0-9_-]{4,32})\/?$/);
+      const shortMatch = window.location.pathname.match(/(?:^|\/)s\/([A-Za-z0-9_-]{1,8})\/?$/);
       if (shortMatch) {
-        try {
-          const compressed = await this.snapshotAdapter.resolveSnapshot(shortMatch[1]);
-          if (compressed) {
-            const decoded = deserializeWorkspaceToken(compressed);
-            if (decoded) {
-              this.applyWorkspace(decoded, 'snapshot', false);
-              return;
-            }
-          }
-        } catch {
-          this.notify('Could not fetch short snapshot; fell back to local workspace.', 'warn');
-        }
+        const loaded = await this.hydrateFromSnapshotId(shortMatch[1]);
+        if (loaded) return;
       }
     }
 
@@ -278,6 +536,49 @@ export class VfsStateService {
     }
 
     this.applyWorkspace(createTemplateWorkspace('typescript'), 'template', false);
+  }
+
+  /**
+   * Hydrates workspace if `window.location.hash` carries `#s=<id>` or `#code=<token>`.
+   * Used both at boot and on `window:hashchange`.
+   */
+  async hydrateFromCurrentHash(): Promise<boolean> {
+    if (typeof window === 'undefined') {
+      return false;
+    }
+    const hash = window.location.hash;
+    const hashShortMatch = hash.match(/^#s=([A-Za-z0-9_-]{1,8})$/);
+    if (hashShortMatch) {
+      return this.hydrateFromSnapshotId(hashShortMatch[1]);
+    }
+
+    if (hash.startsWith('#code=')) {
+      const token = hash.slice('#code='.length);
+      const decoded = deserializeWorkspaceToken(token);
+      if (decoded) {
+        this.applyWorkspace(decoded, 'url-hash', false);
+        return true;
+      }
+      this.notify('Shared URL hash was invalid; loaded fallback workspace.', 'warn');
+    }
+    return false;
+  }
+
+  private async hydrateFromSnapshotId(id: string): Promise<boolean> {
+    try {
+      const compressed = await this.snapshotAdapter.resolveSnapshot(id);
+      if (compressed) {
+        const decoded = deserializeWorkspaceToken(compressed);
+        if (decoded) {
+          this.applyWorkspace(decoded, 'snapshot', false);
+          return true;
+        }
+      }
+      this.notify(`Short snapshot "${id}" was not found or expired.`, 'warn');
+    } catch {
+      this.notify('Could not fetch short snapshot; fell back to local workspace.', 'warn');
+    }
+    return false;
   }
 
   switchEnvironment(env: RuntimeEnvironment): void {
@@ -623,9 +924,37 @@ export class VfsStateService {
   syncShareToUrl(): string {
     const token = this.compressedHashSignal();
     const url = this.shareUrlSignal();
+    this.commitShareHash(`#code=${token}`);
+    return url;
+  }
+
+  setSnapshotEndpoint(endpoint: string): void {
+    const clean = endpoint.trim() || '/api/snapshot';
+    this.snapshotEndpointState.set(clean);
     if (typeof window !== 'undefined') {
       try {
-        window.history.replaceState(null, '', `#code=${token}`);
+        if (clean === '/api/snapshot') {
+          window.localStorage.removeItem(SNAPSHOT_ENDPOINT_STORAGE_KEY);
+        } else {
+          window.localStorage.setItem(SNAPSHOT_ENDPOINT_STORAGE_KEY, clean);
+        }
+      } catch {
+        // Ignore storage access errors in restricted contexts
+      }
+    }
+  }
+
+  async createShortSnapshot(): Promise<SnapshotCreateResult> {
+    const token = this.compressedHashSignal();
+    const result = await this.snapshotAdapter.createSnapshot(token);
+    this.commitShareHash(`#s=${result.id}`);
+    return result;
+  }
+
+  private commitShareHash(hashFragment: string): void {
+    if (typeof window !== 'undefined') {
+      try {
+        window.history.replaceState(null, '', hashFragment);
       } catch {
         // Ignore SecurityError in constrained test environments
       }
@@ -633,16 +962,6 @@ export class VfsStateService {
     this.dirtyState.set(false);
     this.dirtyFilesState.set(new Set());
     void this.persistNow();
-    return url;
-  }
-
-  setSnapshotEndpoint(endpoint: string): void {
-    this.snapshotEndpointState.set(endpoint.trim() || '/api/snapshot');
-  }
-
-  async createShortSnapshot(): Promise<SnapshotCreateResult> {
-    const token = this.compressedHashSignal();
-    return this.snapshotAdapter.createSnapshot(token);
   }
 
   exportWorkspaceZip(): void {
@@ -706,6 +1025,16 @@ export class VfsStateService {
   }
 
   private schedulePersist(): void {
+    if (
+      typeof window !== 'undefined' &&
+      (window.location.hash.startsWith('#code=') || window.location.hash.startsWith('#s='))
+    ) {
+      try {
+        window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+      } catch {
+        // Ignore in sandboxed test environments
+      }
+    }
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
     }

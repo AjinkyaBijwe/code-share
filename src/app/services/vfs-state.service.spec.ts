@@ -1,6 +1,8 @@
 import { TestBed } from '@angular/core/testing';
+import { compressToEncodedURIComponent } from 'lz-string';
 import { createTemplateWorkspace } from '../config/templates.config';
 import {
+  SNAPSHOT_ID_PATTERN,
   VfsStateService,
   deserializeWorkspaceToken,
   serializeWorkspaceToken,
@@ -75,6 +77,86 @@ describe('VfsStateService & Serialization', () => {
     await service.bootstrapHydration();
     expect(service.envSignal()).toBe('angular');
     expect(service.hydrationSourceSignal()).toBe('url-query');
+  });
+
+  it('compresses unchanged templates to 3 chars and delta edits compactly while remaining LZ-compatible', () => {
+    const base = createTemplateWorkspace('typescript');
+    const unmodifiedToken = serializeWorkspaceToken(base);
+    expect(unmodifiedToken).toBe('z0t');
+    expect(deserializeWorkspaceToken(unmodifiedToken)?.files['/index.ts'].content).toBe(
+      base.files['/index.ts'].content,
+    );
+
+    const modified = createTemplateWorkspace('typescript');
+    modified.files['/notes.txt'] = {
+      path: '/notes.txt',
+      content: 'hello world',
+      language: 'plaintext',
+    };
+    modified.activeFile = '/notes.txt';
+    const deltaToken = serializeWorkspaceToken(modified);
+    const legacyToken = compressToEncodedURIComponent(JSON.stringify(modified));
+
+    expect(deltaToken.startsWith('z1.')).toBe(true);
+    expect(deltaToken.length).toBeLessThan(legacyToken.length / 4);
+    const restoredDelta = deserializeWorkspaceToken(deltaToken);
+    expect(restoredDelta?.activeFile).toBe('/notes.txt');
+    expect(restoredDelta?.files['/notes.txt']?.content).toBe('hello world');
+
+    const restoredLegacy = deserializeWorkspaceToken(legacyToken);
+    expect(restoredLegacy?.files['/notes.txt']?.content).toBe('hello world');
+  });
+
+  it('creates and hydrates <=8-char #s= and ?s= snapshots via HttpSnapshotAdapter', async () => {
+    const sample = createTemplateWorkspace('python');
+    sample.files['/main.py'].content = 'print("short slug test")';
+    const token = serializeWorkspaceToken(sample);
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'POST') {
+        return new Response(JSON.stringify({ id: 'Ab3k9Z' }), {
+          status: 201,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/Ab3k9Z')) {
+        return new Response(JSON.stringify({ id: 'Ab3k9Z', payload: token }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      service.setSnapshotEndpoint('https://short.example.workers.dev');
+      service.switchEnvironment('python');
+      service.updateFileContent('/main.py', 'print("short slug test")');
+
+      const created = await service.createShortSnapshot();
+      expect(SNAPSHOT_ID_PATTERN.test(created.id)).toBe(true);
+      expect(created.id.length).toBeLessThanOrEqual(8);
+      expect(created.url).toContain('#s=Ab3k9Z');
+      expect(window.location.hash).toBe('#s=Ab3k9Z');
+
+      service.switchEnvironment('typescript');
+      window.history.replaceState(null, '', '/code-share/#s=Ab3k9Z');
+      await service.bootstrapHydration();
+      expect(service.envSignal()).toBe('python');
+      expect(service.hydrationSourceSignal()).toBe('snapshot');
+      expect(service.filesSignal()['/main.py']?.content).toBe('print("short slug test")');
+
+      service.switchEnvironment('typescript');
+      window.history.replaceState(null, '', '/code-share/?s=Ab3k9Z');
+      await service.bootstrapHydration();
+      expect(service.envSignal()).toBe('python');
+      expect(service.hydrationSourceSignal()).toBe('snapshot');
+    } finally {
+      vi.unstubAllGlobals();
+      service.setSnapshotEndpoint('/api/snapshot');
+    }
   });
 });
 

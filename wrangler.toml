@@ -1,0 +1,19 @@
+name = "codepad-snapshot-worker"
+main = "edge/snapshot-worker.ts"
+compatibility_date = "2025-05-01"
+
+# Option A: Cloudflare Workers KV (create namespace with `npx wrangler kv namespace create CODEPAD_KV`
+# and paste its id below, then run `npx wrangler deploy`).
+# [[kv_namespaces]]
+# binding = "CODEPAD_KV"
+# id = "YOUR_KV_NAMESPACE_ID"
+
+# Option B: Upstash Redis REST (alternative to Cloudflare KV):
+# npx wrangler secret put UPSTASH_REDIS_REST_URL
+# npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
+
+# Optional: Set your canonical CodePad URL (e.g. GitHub Pages URL) if you want the worker
+# response to return the complete share URL directly:
+# [vars]
+# SNAPSHOT_PUBLIC_APP_URL = "https://YOUR_USERNAME.github.io/code-share/"
+
