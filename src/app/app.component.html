@@ -1,0 +1,114 @@
+<div class="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
+  <!-- Top Command Bar -->
+  <app-top-bar
+    (runRequested)="runtime.runActiveWorkspace()"
+    (formatRequested)="formatActiveFile()"
+    (shareRequested)="openShareDialog()"
+    (resetRequested)="resetModalOpen.set(true)"
+  />
+
+  <!-- 3-Pane Resizable Split Workspace -->
+  <main
+    #workspaceGrid
+    class="grid flex-1 min-h-0 w-full overflow-hidden"
+    [style.grid-template-columns]="gridTemplateColumns()"
+  >
+    <!-- Left Pane: Virtual File Explorer -->
+    <div class="min-w-0 min-h-0 overflow-hidden border-r border-border">
+      <app-file-explorer />
+    </div>
+
+    <!-- Left Divider -->
+    <div
+      class="cursor-col-resize bg-background hover:bg-primary/50 transition-colors"
+      title="Drag to resize file explorer (double-click to reset)"
+      (pointerdown)="startLeftResize($event)"
+      (dblclick)="leftWidthPx.set(236)"
+    ></div>
+
+    <!-- Center Pane: Tabbed Monaco Code Editor -->
+    <div class="min-w-0 min-h-0 overflow-hidden border-x border-border">
+      <app-code-editor (shareShortcut)="handleQuickShareSave()" />
+    </div>
+
+    <!-- Right Divider -->
+    <div
+      class="cursor-col-resize bg-background hover:bg-primary/50 transition-colors"
+      title="Drag to resize preview pane (double-click to reset)"
+      (pointerdown)="startRightResize($event)"
+      (dblclick)="rightWidthPx.set(460)"
+    ></div>
+
+    <!-- Right Pane: Vertically Split Preview + Unified Console -->
+    <div class="min-w-0 min-h-0 overflow-hidden border-l border-border">
+      <app-preview-console [isDraggingSplit]="isDraggingDivider()" />
+    </div>
+  </main>
+
+  <!-- Zero-Auth Share Modal -->
+  <app-share-dialog [open]="shareModalOpen()" (close)="shareModalOpen.set(false)" />
+
+  <!-- Reset Confirmation Dialog -->
+  <ui-dialog
+    [open]="resetModalOpen()"
+    title="Reset workspace to template?"
+    description="This replaces your current files in this environment with the clean starter template."
+    (close)="resetModalOpen.set(false)"
+  >
+    <div class="flex items-center justify-end gap-2">
+      <button
+        cpButton
+        variant="outline"
+        size="sm"
+        type="button"
+        (click)="resetModalOpen.set(false)"
+      >
+        Cancel
+      </button>
+      <button
+        cpButton
+        variant="destructive"
+        size="sm"
+        type="button"
+        (click)="confirmReset()"
+      >
+        Reset Workspace
+      </button>
+    </div>
+  </ui-dialog>
+
+  <!-- Toast Notification -->
+  @if (vfs.toastSignal(); as toast) {
+    <div
+      class="fixed bottom-4 right-4 z-50 flex items-center gap-2.5 rounded-lg border px-3.5 py-2.5 text-xs font-medium shadow-2xl backdrop-blur-md"
+      [class.border-emerald-500/40]="toast.tone === 'success'"
+      [class.bg-emerald-950/90]="toast.tone === 'success'"
+      [class.text-emerald-200]="toast.tone === 'success'"
+      [class.border-amber-500/40]="toast.tone === 'warn'"
+      [class.bg-amber-950/90]="toast.tone === 'warn'"
+      [class.text-amber-200]="toast.tone === 'warn'"
+      [class.border-red-500/40]="toast.tone === 'error'"
+      [class.bg-red-950/90]="toast.tone === 'error'"
+      [class.text-red-200]="toast.tone === 'error'"
+      [class.border-border]="toast.tone === 'info'"
+      [class.bg-card/95]="toast.tone === 'info'"
+      [class.text-foreground]="toast.tone === 'info'"
+      role="status"
+      aria-live="polite"
+    >
+      <ui-icon
+        [name]="toast.tone === 'success' ? 'check' : toast.tone === 'error' || toast.tone === 'warn' ? 'alert' : 'code'"
+        iconClass="h-3.5 w-3.5 shrink-0"
+      />
+      <span>{{ toast.text }}</span>
+      <button
+        type="button"
+        class="ml-1 opacity-60 hover:opacity-100 cursor-pointer"
+        aria-label="Dismiss notification"
+        (click)="vfs.clearToast()"
+      >
+        <ui-icon name="x" iconClass="h-3 w-3" />
+      </button>
+    </div>
+  }
+</div>
